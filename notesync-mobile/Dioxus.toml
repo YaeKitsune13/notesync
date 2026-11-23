@@ -1,0 +1,7 @@
+[application]
+name = "NoteSync"
+default_platform = "android"
+
+[bundle]
+identifier = "com.notesync.mobile"
+publisher = "yaekitsune"

@@ -1,0 +1,11 @@
+target/
+.dx/
+*.apk
+*.aab
+*.jks
+*.keystore
+*.db
+*.db-shm
+*.db-wal
+*.token
+.env
