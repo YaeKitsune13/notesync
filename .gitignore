@@ -9,3 +9,5 @@ target/
 *.db-wal
 *.token
 .env
+dist/
+dist/
