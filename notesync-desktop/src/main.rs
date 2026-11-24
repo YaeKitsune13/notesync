@@ -6,6 +6,8 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
+    menu::{ContextMenuExt as _, PopupMenuItem},
+    text::TextView,
     v_flex, Icon, IconName, Sizable,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -41,6 +43,8 @@ struct NoteSyncApp {
     notes: HashMap<String, NoteItem>,
     order: Vec<String>,
     selected_id: Option<String>,
+    pending_delete: Option<String>,
+    reading: bool,
 
     search_input: Entity<InputState>,
     editor_input: Entity<TextareaState>,
@@ -138,6 +142,8 @@ impl NoteSyncApp {
             url_input,
             token_input,
             ignore_editor_change: false,
+            pending_delete: None,
+            reading: false,
             right_view: if need_setup {
                 RightView::Settings
             } else {
@@ -410,6 +416,7 @@ impl NoteSyncApp {
         }
         self.last_edit_at = None;
         if let Some(body) = self.notes.get(&id).map(|n| n.body.clone()) {
+            self.reading = !body.trim().is_empty();
             self.selected_id = Some(id);
             self.set_editor_text(&body, window, cx);
         }
@@ -430,21 +437,23 @@ impl NoteSyncApp {
         self.notes.insert(id.clone(), item);
         self.order.insert(0, id.clone());
         self.selected_id = Some(id);
+        self.reading = false;
         self.set_editor_text("", window, cx);
         self.last_edit_at = Some(Instant::now());
         self.status = "Новая заметка...".into();
         cx.notify();
     }
 
-    fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.selected_id.take() else {
-            return;
-        };
+    // Удаление любой заметки по id (меню по ПКМ в списке и кнопка «Удалить»).
+    fn delete_note(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(note) = self.notes.remove(&id) else {
             return;
         };
         self.order.retain(|x| x != &id);
-        self.set_editor_text("", window, cx);
+        if self.selected_id.as_deref() == Some(id.as_str()) {
+            self.selected_id = None;
+            self.set_editor_text("", window, cx);
+        }
         cx.notify();
 
         if note.base_rev == 0 {
@@ -715,6 +724,7 @@ impl Render for NoteSyncApp {
         let query_lower = self.search_input.read(cx).value().trim().to_lowercase();
 
         // ---------- ЛЕВЫЙ САЙДБАР ----------
+        let view = cx.entity();
         let mut cards = v_flex().gap_1p5().w_full();
         for id in &self.order {
             if let Some(note) = self.notes.get(id) {
@@ -783,6 +793,24 @@ impl Render for NoteSyncApp {
                                 .child(preview),
                         )
                     });
+
+                let menu_view = view.clone();
+                let menu_id = id.clone();
+                let card = card.context_menu(move |menu, _window, _cx| {
+                    let view = menu_view.clone();
+                    let id = menu_id.clone();
+                    menu.item(
+                        PopupMenuItem::new("Удалить")
+                            .icon(gpui_kit::assets::IconName::Trash)
+                            .on_click(move |_, _window, cx| {
+                                let id = id.clone();
+                                view.update(cx, |this, cx| {
+                                    this.pending_delete = Some(id);
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                });
 
                 cards = cards.child(card);
             }
@@ -1310,6 +1338,25 @@ impl Render for NoteSyncApp {
                         .unwrap_or_default();
                     let has_conf = note_info.map(|n| n.has_conflict).unwrap_or(false);
 
+                    let reading = self.reading;
+                    let read_btn = Button::new("toggle-read")
+                        .ghost()
+                        .small()
+                        .icon(Icon::new(if reading {
+                            gpui_kit::assets::IconName::Pencil
+                        } else {
+                            gpui_kit::assets::IconName::BookOpen
+                        }))
+                        .label(if reading {
+                            "Править"
+                        } else {
+                            "Читать"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.reading = !this.reading;
+                            cx.notify();
+                        }));
+
                     let conf_btn = if has_conf {
                         Button::new("open-conflicts")
                             .danger()
@@ -1350,18 +1397,7 @@ impl Render for NoteSyncApp {
                                         .text_color(theme::subtext0())
                                         .child(rev_text),
                                 )
-                                .child(
-                                    h_flex().gap_2().child(conf_btn).child(
-                                        Button::new("delete-note")
-                                            .danger()
-                                            .small()
-                                            .icon(IconName::Delete)
-                                            .label("Удалить")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.delete_selected(window, cx);
-                                            })),
-                                    ),
-                                ),
+                                .child(h_flex().gap_2().child(read_btn).child(conf_btn)),
                         )
                         .child(
                             v_flex()
@@ -1373,14 +1409,24 @@ impl Render for NoteSyncApp {
                                 .bg(theme::mantle())
                                 .border_1()
                                 .border_color(theme::surface0())
-                                .child(
-                                    div().flex_1().min_h_0().w_full().child(
-                                        Textarea::new(&self.editor_input)
-                                            .appearance(false)
-                                            .bordered(false)
-                                            .h_full(),
-                                    ),
-                                ),
+                                .child(div().flex_1().min_h_0().w_full().child(if self.reading {
+                                    let note_id = self.selected_id.clone().unwrap_or_default();
+                                    let body = self.editor_input.read(cx).value().to_string();
+                                    TextView::markdown(
+                                        SharedString::from(format!("reader-{note_id}")),
+                                        body,
+                                    )
+                                    .selectable(true)
+                                    .scrollable(true)
+                                    .size_full()
+                                    .into_any_element()
+                                } else {
+                                    Textarea::new(&self.editor_input)
+                                        .appearance(false)
+                                        .bordered(false)
+                                        .h_full()
+                                        .into_any_element()
+                                })),
                         )
                         .into_any_element()
                 } else {
@@ -1434,7 +1480,72 @@ impl Render for NoteSyncApp {
                 self.last_seq
             )));
 
+        let confirm_overlay = self.pending_delete.clone().map(|id| {
+            let title = self.notes.get(&id).map(|n| n.title()).unwrap_or_default();
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme::crust().opacity(0.6))
+                .child(
+                    v_flex()
+                        .w(px(360.))
+                        .p_5()
+                        .gap_3()
+                        .rounded_xl()
+                        .bg(theme::mantle())
+                        .border_1()
+                        .border_color(theme::surface1())
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::text())
+                                .child("Удалить заметку?"),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme::subtext0())
+                                .truncate()
+                                .child(title),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    Button::new("delete-cancel")
+                                        .small()
+                                        .label("Отмена")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pending_delete = None;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("delete-confirm")
+                                        .danger()
+                                        .small()
+                                        .icon(Icon::new(gpui_kit::assets::IconName::Trash))
+                                        .label("Удалить")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            if let Some(id) = this.pending_delete.take() {
+                                                this.delete_note(id, window, cx);
+                                            }
+                                        })),
+                                ),
+                        ),
+                )
+        });
+
         v_flex()
+            .relative()
             .size_full()
             .bg(theme::base())
             .text_color(theme::text())
@@ -1447,6 +1558,7 @@ impl Render for NoteSyncApp {
                     .child(right_pane),
             )
             .child(status_bar)
+            .children(confirm_overlay)
     }
 }
 

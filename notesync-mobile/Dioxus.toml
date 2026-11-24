@@ -5,3 +5,13 @@ default_platform = "android"
 [bundle]
 identifier = "com.notesync.mobile"
 publisher = "yaekitsune"
+
+# Android: разрешения и HTTP по IP (сервер в локальной сети отвечает по http://, не https://)
+[android.application]
+uses_cleartext_traffic = true
+
+[android.permissions]
+"android.permission.INTERNET" = { description = "Синхронизация заметок с сервером" }
+"android.permission.ACCESS_NETWORK_STATE" = { description = "Проверка состояния сети" }
+"android.permission.ACCESS_WIFI_STATE" = { description = "Поиск сервера в Wi-Fi сети" }
+"android.permission.CHANGE_WIFI_MULTICAST_STATE" = { description = "Автопоиск сервера в локальной сети (mDNS)" }

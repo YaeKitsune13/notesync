@@ -742,6 +742,19 @@ enum Screen {
     Settings,
 }
 
+// Markdown -> HTML. Сырой HTML из заметки не пропускаем: показываем как обычный текст.
+fn md_to_html(src: &str) -> String {
+    use pulldown_cmark::{html, Event, Options, Parser};
+    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let parser = Parser::new_ext(src, opts).map(|ev| match ev {
+        Event::Html(t) | Event::InlineHtml(t) => Event::Text(t),
+        other => other,
+    });
+    let mut out = String::new();
+    html::push_html(&mut out, parser);
+    out
+}
+
 fn note_title(body: &str) -> String {
     body.lines()
         .map(str::trim)
@@ -789,6 +802,13 @@ fn App() -> Element {
     let mut settings_sig = use_signal(|| load_settings(&db.lock().unwrap()));
     let mut status = use_signal(|| SyncStatus::Idle);
     let mut edit_tick = use_signal(|| 0u64);
+
+    // Долгое нажатие на заметку: таймер, флаг «было долгое нажатие» и заметка для удаления
+    let mut press_tick = use_signal(|| 0u64);
+    let mut long_pressed = use_signal(|| false);
+    let mut delete_target = use_signal(|| None::<String>);
+    let mut reading = use_signal(|| false);
+    let db_list_del = db.clone();
 
     let mut manual_url_input = use_signal(|| settings_sig().manual_url.clone());
     let mut token_input = use_signal(|| settings_sig().token.clone());
@@ -852,6 +872,7 @@ fn App() -> Element {
 
     rsx! {
         style { "html, body {{ margin: 0; padding: 0; background: #141218; width: 100%; height: 100%; overflow-x: hidden; }}" }
+        style { ".md {{ font-size: 16px; line-height: 26px; color: #e6e0e9; user-select: text; -webkit-user-select: text; word-wrap: break-word; }} .md h1 {{ font-size: 24px; margin: 20px 0 10px; }} .md h2 {{ font-size: 20px; margin: 18px 0 8px; }} .md h3 {{ font-size: 17px; margin: 16px 0 6px; }} .md p {{ margin: 0 0 12px; }} .md ul, .md ol {{ padding-left: 22px; margin: 0 0 12px; }} .md code {{ background: #2b2930; padding: 2px 6px; border-radius: 6px; font-size: 14px; }} .md pre {{ background: #1d1b20; padding: 12px; border-radius: 12px; overflow-x: auto; margin: 0 0 12px; }} .md pre code {{ background: transparent; padding: 0; }} .md blockquote {{ margin: 0 0 12px; padding: 4px 14px; border-left: 3px solid #d0bcff; color: #cac4d0; }} .md a {{ color: #d0bcff; pointer-events: none; }} .md table {{ border-collapse: collapse; display: block; overflow-x: auto; margin: 0 0 12px; }} .md th, .md td {{ border: 1px solid #49454f; padding: 6px 10px; }} .md hr {{ border: none; border-top: 1px solid #49454f; margin: 16px 0; }} .md img {{ max-width: 100%; }}" }
         div {
             style: "margin: 0; padding: 0; font-family: system-ui, -apple-system, Roboto, sans-serif; background: #141218; color: #e6e0e9; min-height: 100vh; display: flex; flex-direction: column; user-select: none;",
 
@@ -914,6 +935,8 @@ fn App() -> Element {
                         for note in notes() {
                             {
                                 let id = note.id.clone();
+                                let id_press = note.id.clone();
+                                let has_body = !note.body.trim().is_empty();
                                 let title = note_title(&note.body);
                                 let preview = note_preview(&note.body);
                                 let mut badge = String::new();
@@ -928,8 +951,32 @@ fn App() -> Element {
                                 rsx! {
                                     div {
                                         key: "{note.id}",
-                                        style: "background: #211f26; border-radius: 12px; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.3);",
-                                        onclick: move |_| screen.set(Screen::Edit(id.clone())),
+                                        style: "background: #211f26; border-radius: 12px; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.3); -webkit-touch-callout: none; -webkit-user-select: none;",
+                                        oncontextmenu: move |e| e.prevent_default(),
+                                        ontouchstart: move |_| {
+                                            let tick = press_tick() + 1;
+                                            press_tick.set(tick);
+                                            long_pressed.set(false);
+                                            let id_hold = id_press.clone();
+                                            spawn(async move {
+                                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                                if press_tick() == tick {
+                                                    long_pressed.set(true);
+                                                    delete_target.set(Some(id_hold));
+                                                }
+                                            });
+                                        },
+                                        ontouchend: move |_| press_tick.set(press_tick() + 1),
+                                        ontouchmove: move |_| press_tick.set(press_tick() + 1),
+                                        ontouchcancel: move |_| press_tick.set(press_tick() + 1),
+                                        onclick: move |_| {
+                                            if long_pressed() {
+                                                long_pressed.set(false);
+                                            } else {
+                                                reading.set(has_body);
+                                                screen.set(Screen::Edit(id.clone()));
+                                            }
+                                        },
                                         div {
                                             style: "display: flex; justify-content: space-between; align-items: center; gap: 8px;",
                                             span {
@@ -967,10 +1014,74 @@ fn App() -> Element {
                                 save_local_edit(&conn, &new_id, "");
                                 notes.set(load_notes(&conn));
                             }
+                            reading.set(false);
                             screen.set(Screen::Edit(new_id));
                         }
                     },
                     "+"
+                }
+
+                if let Some(del_id) = delete_target() {
+                    {
+                        let del_note = notes().into_iter().find(|n| n.id == del_id);
+                        let del_title = del_note
+                            .as_ref()
+                            .map(|n| note_title(&n.body))
+                            .unwrap_or_default();
+                        let del_rev = del_note.as_ref().map(|n| n.base_rev).unwrap_or(0);
+                        let db_yes = db_list_del.clone();
+                        rsx! {
+                            div {
+                                style: "position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: flex; align-items: flex-end; justify-content: center; z-index: 50;",
+                                onclick: move |_| delete_target.set(None),
+                                div {
+                                    style: "width: 100%; box-sizing: border-box; background: #2b2930; border-radius: 24px 24px 0 0; padding: 20px 20px 28px 20px; display: flex; flex-direction: column; gap: 14px;",
+                                    onclick: move |e| e.stop_propagation(),
+                                    div { style: "font-size: 13px; color: #cac4d0;", "Заметка" }
+                                    div {
+                                        style: "font-size: 17px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;",
+                                        "{del_title}"
+                                    }
+                                    button {
+                                        style: "display: flex; align-items: center; justify-content: center; gap: 10px; background: #8c1d18; color: #f9dedc; border: none; border-radius: 14px; padding: 14px; font-size: 16px; font-weight: 500;",
+                                        onclick: move |_| {
+                                            let need_sync = {
+                                                let conn = db_yes.lock().unwrap();
+                                                let s = delete_local_note(&conn, &del_id, del_rev);
+                                                notes.set(load_notes(&conn));
+                                                s
+                                            };
+                                            delete_target.set(None);
+                                            if need_sync {
+                                                trigger_sync(&db_yes, status, notes, settings_sig);
+                                            }
+                                        },
+                                        svg {
+                                            width: "20",
+                                            height: "20",
+                                            view_box: "0 0 24 24",
+                                            fill: "none",
+                                            stroke: "currentColor",
+                                            stroke_width: "2",
+                                            stroke_linecap: "round",
+                                            stroke_linejoin: "round",
+                                            path { d: "M3 6h18" }
+                                            path { d: "M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" }
+                                            path { d: "M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" }
+                                            line { x1: "10", y1: "11", x2: "10", y2: "17" }
+                                            line { x1: "14", y1: "11", x2: "14", y2: "17" }
+                                        }
+                                        "Удалить"
+                                    }
+                                    button {
+                                        style: "background: transparent; color: #d0bcff; border: none; padding: 12px; font-size: 15px; font-weight: 500;",
+                                        onclick: move |_| delete_target.set(None),
+                                        "Отмена"
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -980,14 +1091,13 @@ fn App() -> Element {
                     let current = notes().into_iter().find(|n| n.id == note_id);
                     let current_body = current.as_ref().map(|n| n.body.clone()).unwrap_or_default();
                     let current_title = note_title(&current_body);
+                    let md_html = md_to_html(&current_body);
+                    let toggle_label = if reading() { "Править" } else { "Читать" };
                     let has_conflict = current.as_ref().map(|n| n.has_conflict).unwrap_or(false);
-                    let base_rev = current.as_ref().map(|n| n.base_rev).unwrap_or(0);
 
                     let id_input = note_id.clone();
-                    let id_del = note_id.clone();
                     let id_conf = note_id.clone();
                     let db_edit = db.clone();
-                    let db_del = db.clone();
                     let db_back = db.clone();
 
                     rsx! {
@@ -1026,20 +1136,9 @@ fn App() -> Element {
                                 "Конфликты"
                             }
                             button {
-                                style: "background: transparent; color: #f2b8b5; border: none; padding: 8px 10px; font-size: 14px; font-weight: 500;",
-                                onclick: move |_| {
-                                    let need_sync = {
-                                        let conn = db_del.lock().unwrap();
-                                        let s = delete_local_note(&conn, &id_del, base_rev);
-                                        notes.set(load_notes(&conn));
-                                        s
-                                    };
-                                    if need_sync {
-                                        trigger_sync(&db_del, status, notes, settings_sig);
-                                    }
-                                    screen.set(Screen::List);
-                                },
-                                "Удалить"
+                                style: "background: transparent; color: #d0bcff; border: none; padding: 8px 10px; font-size: 14px; font-weight: 500;",
+                                onclick: move |_| reading.set(!reading()),
+                                "{toggle_label}"
                             }
                         }
 
@@ -1055,6 +1154,13 @@ fn App() -> Element {
                             }
                         }
 
+                        if reading() {
+                            div {
+                                class: "md",
+                                style: "flex: 1; padding: 12px 20px 24px 20px; overflow-y: auto;",
+                                dangerous_inner_html: "{md_html}",
+                            }
+                        } else {
                         div { style: "flex: 1; padding: 12px; display: flex;",
                             textarea {
                                 style: "flex: 1; width: 100%; background: #1d1b20; color: #e6e0e9; border: 1px solid #49454f; border-radius: 12px; padding: 14px; font-size: 16px; line-height: 24px; font-family: inherit; box-sizing: border-box; resize: none; outline: none; user-select: text;",
@@ -1069,6 +1175,7 @@ fn App() -> Element {
                                     edit_tick.set(edit_tick() + 1);
                                 }
                             }
+                        }
                         }
                     }
                 }
@@ -1396,4 +1503,3 @@ fn App() -> Element {
         }
     }
 }
-
