@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -109,11 +110,105 @@ impl NoteItem {
     }
 }
 
+// Файл настроек ~/.config/notesync-desktop.json. Все ключи необязательны:
+// чего нет в файле, берётся значение по умолчанию (файл при запуске дописывается).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClientConfig {
+    // подключение
     pub server_url: String,
     pub token: String,
     pub device_id: String,
+    // внешний вид
+    #[serde(default = "default_theme")]
+    pub theme: String, // mocha | macchiato | frappe | latte | имя файла из ~/.config/notesync/themes
+    #[serde(default = "default_font_size")]
+    pub font_size: f32, // размер текста заметки, px
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32, // масштаб интерфейса (Ctrl + / Ctrl -), 0.6..2.5
+    #[serde(default = "default_opacity")]
+    pub window_opacity: f32, // прозрачность фонов, 0.2..1.0
+    #[serde(default)]
+    pub window_blur: bool, // размытие под окном (если поддерживает композитор)
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f32,
+    #[serde(default)]
+    pub font_family: String, // шрифт интерфейса и превью ("" — по умолчанию)
+    #[serde(default)]
+    pub editor_font_family: String, // шрифт редактора ("" — по умолчанию)
+    #[serde(default = "default_true")]
+    pub show_note_preview: bool, // вторая строка с началом текста в списке
+    // поведение
+    #[serde(default = "default_start_mode")]
+    pub start_mode: String, // preview | split | edit
+    #[serde(default = "default_true")]
+    pub confirm_delete: bool,
+    #[serde(default = "default_save_delay")]
+    pub save_delay_ms: u64, // пауза в наборе перед отправкой на сервер
+    #[serde(default = "default_sync_interval")]
+    pub sync_interval_ms: u64, // как часто спрашивать сервер о новых заметках
+    // Поверх выбранной темы: {"blue": "#f5c2e7", "base": "#1e1e2ecc"} (8 цифр — с прозрачностью)
+    #[serde(default)]
+    pub colors: HashMap<String, String>,
+}
+
+fn default_theme() -> String {
+    "mocha".to_string()
+}
+
+fn default_font_size() -> f32 {
+    15.0
+}
+
+fn default_ui_scale() -> f32 {
+    1.0
+}
+
+fn default_opacity() -> f32 {
+    1.0
+}
+
+fn default_sidebar_width() -> f32 {
+    260.0
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_start_mode() -> String {
+    "preview".to_string()
+}
+
+fn default_save_delay() -> u64 {
+    300
+}
+
+fn default_sync_interval() -> u64 {
+    1000
+}
+
+impl ClientConfig {
+    fn new(server_url: String, token: String, device_id: String) -> Self {
+        ClientConfig {
+            server_url,
+            token,
+            device_id,
+            theme: default_theme(),
+            font_size: default_font_size(),
+            ui_scale: default_ui_scale(),
+            window_opacity: default_opacity(),
+            window_blur: false,
+            sidebar_width: default_sidebar_width(),
+            font_family: String::new(),
+            editor_font_family: String::new(),
+            show_note_preview: true,
+            start_mode: default_start_mode(),
+            confirm_delete: true,
+            save_delay_ms: default_save_delay(),
+            sync_interval_ms: default_sync_interval(),
+            colors: HashMap::new(),
+        }
+    }
 }
 
 pub fn config_path() -> PathBuf {
@@ -124,17 +219,28 @@ pub fn config_path() -> PathBuf {
     }
 }
 
+// Читает настройки; при ошибке в JSON возвращает текст ошибки (файл не трогаем).
+pub fn try_load_config() -> Result<ClientConfig, String> {
+    let raw = std::fs::read_to_string(config_path())
+        .map_err(|e| format!("Не удалось прочитать {}: {e}", config_path().display()))?;
+    serde_json::from_str::<ClientConfig>(&raw)
+        .map_err(|e| format!("Ошибка в {}: {e}", config_path().display()))
+}
+
 pub fn load_config() -> ClientConfig {
-    if let Ok(raw) = std::fs::read_to_string(config_path()) {
-        if let Ok(cfg) = serde_json::from_str::<ClientConfig>(&raw) {
-            return cfg;
-        }
-    }
-    ClientConfig {
-        server_url: std::env::var("NOTESYNC_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8787".to_string()),
-        token: std::env::var("NOTESYNC_TOKEN").unwrap_or_default(),
-        device_id: format!("pc-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+    try_load_config().unwrap_or_else(|_| {
+        ClientConfig::new(
+            std::env::var("NOTESYNC_URL").unwrap_or_else(|_| "http://127.0.0.1:8787".to_string()),
+            std::env::var("NOTESYNC_TOKEN").unwrap_or_default(),
+            format!("pc-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+        )
+    })
+}
+
+// Дописывает в файл настроек недостающие ключи (только если файл читается без ошибок).
+pub fn normalize_config() {
+    if let Ok(cfg) = try_load_config() {
+        save_config(&cfg);
     }
 }
 

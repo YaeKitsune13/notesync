@@ -68,6 +68,7 @@ notesync-desktop
 | `GET`    | `/notes/:id`                               | Получение конкретной заметки                                  |
 | `PUT`    | `/notes/:id`                               | Создание или обновление с проверкой `base_rev`                |
 | `DELETE` | `/notes/:id?base_rev=<rev>&device_id=<id>` | Мягкое удаление заметки                                       |
+| `PUT`    | `/notes/:id/stream`                        | Потоковая запись без конфликтов (последняя запись побеждает)  |
 | `GET`    | `/notes/:id/versions`                      | История версий и неразрешённых конфликтов                     |
 | `POST`   | `/notes/:id/conflicts/:vid/resolve`        | Разрешение конфликта (`keep_server`, `use_this`, `keep_both`) |
 | `GET`    | `/log?limit=100`                           | Журнал событий синхронизации                                  |

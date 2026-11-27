@@ -10,7 +10,7 @@ use axum::{
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use mdns_sd;
@@ -128,6 +128,16 @@ fn add_version(
         params![note_id, rev, body, device, ts, is_conflict as i64],
     )?;
     Ok(c.last_insert_rowid())
+}
+
+// Какое устройство записало последнюю обычную (не конфликтную) версию заметки.
+fn head_device(c: &Connection, note_id: &str) -> rusqlite::Result<Option<String>> {
+    c.query_row(
+        "SELECT device_id FROM note_versions WHERE note_id = ?1 AND is_conflict = 0 ORDER BY id DESC LIMIT 1",
+        params![note_id],
+        |r| r.get(0),
+    )
+    .optional()
 }
 
 // Строка заметки -> JSON. Последнее поле — число неразрешённых конфликтов.
@@ -260,8 +270,12 @@ async fn put_note(
             json!({ "status": "ok", "rev": 1, "seq": seq })
         }
         Some((body, rev, deleted, note_seq)) => {
-            if req.base_rev == rev {
-                // Клиент правил последнюю версию — принимаем.
+            // Принимаем, если клиент правил последнюю ревизию, либо если последнюю версию
+            // записало это же устройство (устаревший base_rev из-за двух правок подряд):
+            // чужие правки при этом не теряются.
+            let accept = req.base_rev == rev
+                || (!deleted && head_device(&tx, &id)?.as_deref() == Some(req.device_id.as_str()));
+            if accept {
                 let new_rev = rev + 1;
                 let seq = next_seq(&tx)?;
                 tx.execute(
@@ -299,6 +313,65 @@ async fn put_note(
         "INSERT INTO edits (edit_id, response) VALUES (?1, ?2)",
         params![req.edit_id, result.to_string()],
     )?;
+    tx.commit()?;
+    Ok(Json(result))
+}
+
+// PUT /notes/:id/stream — потоковая запись.
+// Без проверки base_rev и без конфликтных версий: последний присланный текст становится
+// основным. Чтобы не терять историю совсем, раз в минуту в неё попадает снимок текста.
+async fn put_stream(
+    State(app): State<Shared>,
+    Path(id): Path<String>,
+    Json(req): Json<PutBody>,
+) -> Res {
+    let mut db = app.db.lock().unwrap_or_else(|e| e.into_inner());
+    let tx = db.transaction()?;
+
+    let current: Option<(String, i64, bool)> = tx
+        .query_row(
+            "SELECT body, rev, deleted FROM notes WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
+        )
+        .optional()?;
+    let ts = now(&tx)?;
+
+    let result = match current {
+        None => {
+            let seq = next_seq(&tx)?;
+            tx.execute(
+                "INSERT INTO notes (id, body, rev, deleted, updated_at, seq) VALUES (?1,?2,1,0,?3,?4)",
+                params![id, req.body, ts, seq],
+            )?;
+            add_version(&tx, &id, 1, &req.body, &req.device_id, false)?;
+            add_log(&tx, &req.device_id, &id, "create", "поток")?;
+            json!({ "status": "ok", "rev": 1, "seq": seq })
+        }
+        Some((body, rev, deleted)) => {
+            if !deleted && body == req.body {
+                json!({ "status": "ok", "rev": rev })
+            } else {
+                let new_rev = rev + 1;
+                let seq = next_seq(&tx)?;
+                tx.execute(
+                    "UPDATE notes SET body=?1, rev=?2, deleted=0, updated_at=?3, seq=?4 WHERE id=?5",
+                    params![req.body, new_rev, ts, seq, id],
+                )?;
+                let recent: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM note_versions WHERE note_id = ?1 AND is_conflict = 0
+                     AND created_at > strftime('%Y-%m-%dT%H:%M:%SZ','now','-60 seconds')",
+                    params![id],
+                    |r| r.get(0),
+                )?;
+                if recent == 0 {
+                    add_version(&tx, &id, new_rev, &req.body, &req.device_id, false)?;
+                    add_log(&tx, &req.device_id, &id, "update", "поток")?;
+                }
+                json!({ "status": "ok", "rev": new_rev, "seq": seq })
+            }
+        }
+    };
     tx.commit()?;
     Ok(Json(result))
 }
@@ -610,6 +683,7 @@ async fn main() {
             "/notes/:id",
             get(get_note).put(put_note).delete(delete_note),
         )
+        .route("/notes/:id/stream", put(put_stream))
         .route("/notes/:id/versions", get(versions))
         .route("/notes/:id/conflicts/:vid/resolve", post(resolve))
         .route("/log", get(get_log))
@@ -621,7 +695,6 @@ async fn main() {
         .expect("не удалось занять порт");
     println!("notesync слушает порт {port}, база: {db_path}");
     let mdns = start_mdns(port);
-    println!("notesync слушает порт {port}, база: {db_path}");
     axum::serve(listener, router).await.expect("ошибка сервера");
     if let Some(m) = mdns {
         let _ = m.shutdown();
